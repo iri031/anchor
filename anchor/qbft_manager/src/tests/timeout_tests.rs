@@ -23,7 +23,7 @@ use crate::{
     instance::qbft_instance,
 };
 
-use super::generate_test_data;
+use super::harness::generate_test_data;
 
 // very important: set paused to true for deterministic timer
 #[tokio::test(start_paused = true)]

@@ -1,28 +1,27 @@
 use std::{
     collections::HashMap,
     sync::{Arc, LazyLock, RwLock, RwLockWriteGuard},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use message_sender::testing::MockMessageSender;
 use processor::Senders;
-use qbft::InstanceHeight;
 use slot_clock::{ManualSlotClock, SlotClock};
 use ssv_types::{
-    Cluster, ClusterId, IndexSet, OperatorId,
-    consensus::{QbftMessage, QbftMessageType},
+    Cluster, ClusterId, CommitteeId, IndexSet, OperatorId,
+    consensus::{BeaconVote, QbftMessage, QbftMessageType},
     domain_type::DomainType,
     message::SignedSSVMessage,
 };
 use ssz::Decode;
-use task_executor::TaskExecutor;
+use task_executor::{ShutdownReason, TaskExecutor};
 use tokio::{
     pin, select,
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     time::sleep,
 };
 use tracing::{debug, error};
-use types::Hash256;
+use types::{Hash256, Slot};
 
 use crate::{
     CommitteeInstanceId, Completed, QbftDecidable, QbftError, QbftManager, WrappedQbftMessage,
@@ -245,7 +244,7 @@ impl OperatorBehavior {
         self.status = OperationalStatus::Offline;
     }
 
-    // Set this node online, aka noraml behavior
+    // Set this node online, aka normal behavior
     pub fn set_online(&mut self) {
         self.status = OperationalStatus::Online;
     }
@@ -424,9 +423,6 @@ where
                 maybe_signed = network_rx.recv() => {
                     match maybe_signed {
                         Some(signed) => {
-                            // We have a signed ssv message. The next step is to then broadcast this onto
-                            // the network. Here, we will just mock this now being received by all of the
-                            // other instances
                             let wrapped = self.signed_to_wrapped(signed);
                             self.process_network_message(wrapped);
                         },
@@ -484,7 +480,6 @@ where
                 }
             },
             Err(e) => {
-                // Just log the error
                 error!("{:?}", e);
             }
         }
@@ -614,4 +609,68 @@ pub struct ConsensusResult {
     pub(crate) successful: u64,
     pub(crate) timed_out: u64,
     pub(crate) aggregated_commit: Option<SignedSSVMessage>,
+}
+
+/// Keeps the TaskExecutor alive for the duration of the test.
+/// When dropped, the executor receives a signal to shut down.
+pub type TaskExecutorKeepalive = async_channel::Sender<()>;
+
+/// Generates unique test data for scenarios.
+pub(crate) fn generate_test_data(id: usize) -> (BeaconVote, CommitteeInstanceId) {
+    let id = CommitteeInstanceId {
+        committee: CommitteeId([0; 32]),
+        instance_height: id.into(),
+    };
+
+    let data = BeaconVote {
+        block_root: Hash256::random(),
+        source: types::Checkpoint::default(),
+        target: types::Checkpoint::default(),
+    };
+
+    (data, id)
+}
+
+/// Provides test setup.
+pub(crate) struct Setup {
+    pub executor: TaskExecutor,
+    pub task_executor_keepalive: TaskExecutorKeepalive,
+    pub _shutdown: futures::channel::mpsc::Sender<ShutdownReason>,
+    pub clock: ManualSlotClock,
+    pub all_data: Vec<(BeaconVote, CommitteeInstanceId)>,
+}
+
+/// Sets up the executor, slot clock, and test data for a scenario test.
+pub(crate) fn setup_test(num_instances: usize) -> Setup {
+    *TRACING;
+
+    let handle = tokio::runtime::Handle::current();
+    let (signal, exit) = async_channel::bounded(1);
+    let (shutdown, _) = futures::channel::mpsc::channel(1);
+    let executor = TaskExecutor::new(handle, exit, shutdown.clone(), "qbft_tests".into());
+
+    let slot_duration = Duration::from_secs(12);
+    let genesis_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let clock = ManualSlotClock::new(
+        Slot::new(0),
+        Duration::from_secs(genesis_time),
+        slot_duration,
+    );
+
+    let mut all_data = vec![];
+    for id in 1..num_instances + 1 {
+        all_data.push(generate_test_data(id))
+    }
+
+    Setup {
+        executor,
+        task_executor_keepalive: signal,
+        _shutdown: shutdown,
+        clock,
+        all_data,
+    }
 }
